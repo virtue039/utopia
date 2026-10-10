@@ -204,3 +204,172 @@ async fn a_namesake_tie_creates_an_entity_and_two_reviews() -> anyhow::Result<()
         .await?;
     run
 }
+
+// #1136: topic scores, missing profiles and fact counts cannot choose between known namesakes.
+#[tokio::test]
+async fn namesakes_without_a_clue_are_reviewed_outside_the_tie_margin() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let mut outcomes = Vec::new();
+    for case in [
+        "unequal_scores",
+        "unprofiled",
+        "no_context",
+        "shared_alias",
+        "unbound_typed",
+        "unbound_mixed",
+    ] {
+        let f = seed(&pool).await?;
+        let run = async {
+            sqlx::query("UPDATE entities SET profile_embedding = $2::vector WHERE id = $1")
+                .bind(f.zhang_b)
+                .bind(if case == "unprofiled" {
+                    None
+                } else {
+                    Some("[0.8,0.6,0]")
+                })
+                .execute(&pool)
+                .await?;
+            if case == "shared_alias" {
+                for (id, name) in [
+                    (f.zhang_a, "Engineering Zhang Wei"),
+                    (f.zhang_b, "Finance Zhang Wei"),
+                ] {
+                    sqlx::query(
+                        "UPDATE entities SET canonical_name = $2, type_id = NULL WHERE id = $1",
+                    )
+                    .bind(id)
+                    .bind(name)
+                    .execute(&pool)
+                    .await?;
+                    utopia_store::names::record(&pool, f.kb, id, "Zhang Wei", None, None).await?;
+                }
+            }
+            if case == "unbound_mixed" {
+                sqlx::query("UPDATE entities SET type_id = NULL WHERE id = $1")
+                    .bind(f.zhang_b)
+                    .execute(&pool)
+                    .await?;
+            }
+            let ctx = if case == "unprofiled" {
+                [0.0, 0.0, 1.0]
+            } else {
+                [1.0, 0.0, 0.0]
+            };
+            let r = utopia_store::resolution::resolve_mention(
+                &pool,
+                f.kb,
+                (!matches!(case, "shared_alias" | "unbound_typed" | "unbound_mixed"))
+                    .then_some(f.person),
+                "Zhang Wei",
+                (case != "no_context").then_some(ctx.as_slice()),
+                None,
+                Some("Zhang Wei received an award."),
+                &[],
+            )
+            .await?;
+            let mut others: Vec<_> = r.reviews.iter().map(|v| v.other_id).collect();
+            others.sort();
+            let mut expected = vec![f.zhang_a, f.zhang_b];
+            expected.sort();
+            outcomes.push((
+                case,
+                r.created
+                    && !expected.contains(&r.entity_id)
+                    && others == expected
+                    && r.reviews.iter().all(|v| v.stage == ReviewStage::Human),
+            ));
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(f.org)
+            .execute(&pool)
+            .await?;
+        run?;
+    }
+    assert!(
+        outcomes.iter().all(|(_, safe)| *safe),
+        "silent namesake attachment: {outcomes:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_single_namesake_still_resolves_without_a_clue() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+    let run = async {
+        sqlx::query("DELETE FROM entities WHERE id = $1")
+            .bind(f.zhang_b)
+            .execute(&pool)
+            .await?;
+        for ctx in [None, Some([1.0, 0.0, 0.0])] {
+            let r = utopia_store::resolution::resolve_mention(
+                &pool,
+                f.kb,
+                Some(f.person),
+                "Zhang Wei",
+                ctx.as_ref().map(|v| v.as_slice()),
+                None,
+                Some("Zhang Wei received an award."),
+                &[],
+            )
+            .await?;
+            assert_eq!(r.entity_id, f.zhang_a);
+            assert!(!r.created && r.reviews.is_empty());
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    run
+}
+
+#[tokio::test]
+async fn a_namesakes_fact_outweighs_a_higher_topic_score() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+    let run = async {
+        sqlx::query("UPDATE entities SET profile_embedding = '[0.8,0.6,0]'::vector WHERE id = $1")
+            .bind(f.zhang_b)
+            .execute(&pool)
+            .await?;
+        for type_id in [Some(f.person), None] {
+            let r = utopia_store::resolution::resolve_mention(
+                &pool,
+                f.kb,
+                type_id,
+                "Zhang Wei",
+                Some(&[1.0, 0.0, 0.0]),
+                None,
+                Some("Zhang Wei of Finance signed the report."),
+                &[],
+            )
+            .await?;
+            assert_eq!(
+                r.entity_id, f.zhang_b,
+                "Finance belongs to the lower-scoring namesake"
+            );
+            assert!(!r.created && r.reviews.is_empty());
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    run
+}

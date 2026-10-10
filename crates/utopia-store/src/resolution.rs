@@ -194,6 +194,8 @@ struct Candidate {
     profile_embedding: Option<Vector>,
     profile_n: i32,
     degree: i64,
+    exact_name: bool,
+    same_type: bool,
 }
 
 /// 消解结果：mention 落到了哪个实体；附带需要入队的疑似重复审核对
@@ -355,8 +357,8 @@ async fn type_label(pool: &PgPool, type_id: Uuid) -> AppResult<Option<String>> {
 }
 
 /// 通道 1：名字字面相等的候选，按画像分层归并或新建（原 `resolve_mention` 的全部）。
-/// `context` 为 mention 所在分块的向量（无 embedding 模型时为 None，退化为 v1 行为：
-/// 同名归并到事实最多的候选）。
+/// `context` 为 mention 所在分块的向量。多个候选使用这次的同一个名字时，
+/// 画像与事实数量不能证明是谁；先问原文旁证，分不开就交给人。
 #[allow(clippy::too_many_arguments)]
 async fn resolve_by_name(
     pool: &PgPool,
@@ -382,31 +384,98 @@ async fn resolve_by_name(
         "SELECT e.id, e.canonical_name, e.profile_embedding, e.profile_n,
                 (SELECT count(*) FROM facts f
                  WHERE f.kb_id = e.kb_id AND (f.subject_id = e.id OR f.object_id = e.id)
-                   AND f.invalidated_at IS NULL AND {not_name}) AS degree
+                   AND f.invalidated_at IS NULL AND {not_name}) AS degree,
+                (lower(e.canonical_name) = ANY($4) OR {exact_named}) AS exact_name,
+                e.type_id IS NOT DISTINCT FROM $2 AS same_type
          FROM entities e
          -- IS NOT DISTINCT FROM 而不是 =（0009 的那个陷阱）：开放图谱里的实体都没有类
          -- （类由对齐来定），`type_id = NULL` 永远不成立，同名的它就永远撞不上——
          -- 实测一个库里 Securities and Exchange Commission 与它的全大写写法成了两个实体
-         WHERE e.kb_id = $1 AND e.type_id IS NOT DISTINCT FROM $2 AND e.merged_into IS NULL
+         WHERE e.kb_id = $1 AND e.merged_into IS NULL
+           AND (e.type_id IS NOT DISTINCT FROM $2
+                OR ($2::uuid IS NULL AND (lower(e.canonical_name) = ANY($4) OR {exact_named})))
            -- 被描述的东西没有名字（0044）：它的 canonical_name 只是显示用的描述，
            -- 不是召回的桥——两篇文档里描述得一样的两个东西不能因此接到一起
            AND e.description IS NULL
            AND (lower(e.canonical_name) = ANY($3) OR {named})",
         not_name = crate::names::not_a_name("f"),
         named = crate::names::has_name_in("e", 1, 3),
+        exact_named = crate::names::has_name_in("e", 1, 4),
     ))
     .bind(kb_id)
     .bind(type_id)
     .bind(&keys)
+    .bind(vec![name.to_lowercase()])
     .fetch_all(pool)
     .await?
     .into_iter()
     .filter(|candidate: &Candidate| !exclude.contains(&candidate.id))
     .collect();
 
+    // #1136: 两个同名人的话题可以一样，也可以拉开。分差大于 0.02 不代表
+    // 名字突然有了身份信息，无画像或没配 embedding 也不能按事实数量猜。
+    // 只拦本次名字真的被多人使用的情形，泛用后缀扩召回不是同名的证据。
+    // 名字事实也算：两个不同 canonical_name 都可能被原文叫作「张伟」。
+    // 未绑定的类别词不能过滤已分类的同名人；否则一个尚未分类的工程师会
+    // 成为唯一候选，原文中的财务总监连旁证这一关都进不来。
+    let namesakes: Vec<_> = candidates.iter().filter(|c| c.exact_name).collect();
+    if namesakes.len() > 1 {
+        if let Some(t) = text {
+            if let Some(c) = corroborating_candidate(pool, kb_id, &namesakes, t).await? {
+                if let Some(ctx) = context {
+                    update_profile(pool, c.id, c.profile_n, ctx).await?;
+                } else {
+                    touch_entity(pool, c.id).await?;
+                }
+                return Ok(Resolution {
+                    entity_id: c.id,
+                    created: false,
+                    reviews: Vec::new(),
+                });
+            }
+        }
+        // 锁内同名回捞也得排除这些候选，否则刚决定不猜，又在建实体时猜回去。
+        let weighed: Vec<_> = exclude
+            .iter()
+            .copied()
+            .chain(candidates.iter().map(|c| c.id))
+            .collect();
+        let (id, created) = create_entity(pool, kb_id, type_id, &name, context, &weighed).await?;
+        if created {
+            refresh_disambiguators(pool, kb_id, &name).await?;
+        }
+        let reviews = if created {
+            namesakes
+                .into_iter()
+                .map(|c| {
+                    let score = context
+                        .and_then(|ctx| {
+                            c.profile_embedding
+                                .as_ref()
+                                .and_then(|p| cosine(p.as_slice(), ctx))
+                        })
+                        .unwrap_or(1.0);
+                    ReviewRequest {
+                        other_id: c.id,
+                        score,
+                        reason: format!("namesake_tie|{score:.2}"),
+                        stage: ReviewStage::Human,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        return Ok(Resolution {
+            entity_id: id,
+            created,
+            reviews,
+        });
+    }
+
+    // 额外召回的已分类同名实体只参与上述歧义检查；没有歧义时保持类型漂移的处置。
+    let candidates: Vec<_> = candidates.into_iter().filter(|c| c.same_type).collect();
     if candidates.is_empty() {
-        // 同类型无候选 ≠ 新名字：类型标签会漂（同一团队被抽成 organization/project/
-        // concept），先查其它类型下的同名实体，按类型对的互斥强度分流。
         return resolve_type_drift(pool, kb_id, type_id, &name, &keys, context, exclude).await;
     }
 
