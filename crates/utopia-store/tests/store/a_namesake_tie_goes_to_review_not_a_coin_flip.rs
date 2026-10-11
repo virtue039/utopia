@@ -373,3 +373,88 @@ async fn a_namesakes_fact_outweighs_a_higher_topic_score() -> anyhow::Result<()>
         .await?;
     run
 }
+
+// Every call can be a new document: an unresolved mention is not a third known namesake.
+#[tokio::test]
+async fn recurring_ambiguous_mentions_share_one_unresolved_entity() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+    let run = async {
+        sqlx::query("UPDATE entities SET profile_embedding = '[0.8,0.6,0]'::vector WHERE id = $1")
+            .bind(f.zhang_b)
+            .execute(&pool)
+            .await?;
+        let mut ids = Vec::new();
+        for _ in 0..20 {
+            let r = utopia_store::resolution::resolve_mention(
+                &pool, f.kb, Some(f.person), "Zhang Wei", Some(&[1.0, 0.0, 0.0]),
+                None, Some("Zhang Wei received an award."), &[],
+            ).await?;
+            for rv in &r.reviews {
+                utopia_store::resolution::create_review(
+                    &pool, f.kb, r.entity_id, rv.other_id, rv.score, &rv.reason, rv.stage,
+                ).await?;
+            }
+            ids.push(r.entity_id);
+        }
+        let entities: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM entities WHERE kb_id = $1 AND lower(canonical_name) = 'zhang wei' AND merged_into IS NULL",
+        ).bind(f.kb).fetch_one(&pool).await?;
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM resolution_reviews WHERE kb_id = $1 AND status = 'pending' AND stage = 'human'",
+        ).bind(f.kb).fetch_one(&pool).await?;
+        assert_eq!((entities, reviews), (3, 2), "20 mentions must add one unresolved entity and two reviews");
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert!(![f.zhang_a, f.zhang_b].contains(&ids[0]));
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    run
+}
+
+#[tokio::test]
+async fn parallel_mentions_do_not_create_two_unresolved_entities() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+    let run = async {
+        let resolve = |type_id, name| utopia_store::resolution::resolve_mention(
+            &pool, f.kb, type_id, name, Some(&[1.0, 0.0, 0.0]), None,
+            Some("Zhang Wei received an award."), &[],
+        );
+        let (a, b) = tokio::join!(resolve(Some(f.person), "Zhang Wei"), resolve(None, "zhang wei"));
+        let (a, b) = (a?, b?);
+        assert_eq!(a.entity_id, b.entity_id);
+        assert_ne!(a.created, b.created);
+        // No caller has persisted returned reviews yet: the unresolved marker must be atomic.
+        let reviews: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM resolution_reviews WHERE kb_id = $1 AND status = 'pending' AND stage = 'human'",
+        ).bind(f.kb).fetch_one(&pool).await?;
+        assert_eq!(reviews, 2);
+        // Facts of an unresolved mention are not evidence that it is the finance namesake.
+        sqlx::query(
+            "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id)
+             SELECT $1, kb_id, $2, predicate_id, object_id FROM facts WHERE subject_id = $3",
+        ).bind(Uuid::now_v7()).bind(a.entity_id).bind(f.zhang_b).execute(&pool).await?;
+        let placed = utopia_store::resolution::resolve_mention(
+            &pool, f.kb, None, "Zhang Wei", Some(&[1.0, 0.0, 0.0]), None,
+            Some("Zhang Wei of Finance signed the report."), &[],
+        ).await?;
+        assert_eq!(placed.entity_id, f.zhang_b);
+        assert!(!placed.created && placed.reviews.is_empty());
+        Ok::<_, anyhow::Error>(())
+    }.await;
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    run
+}

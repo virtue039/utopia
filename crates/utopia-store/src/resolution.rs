@@ -196,6 +196,7 @@ struct Candidate {
     degree: i64,
     exact_name: bool,
     same_type: bool,
+    unresolved: bool,
 }
 
 /// 消解结果：mention 落到了哪个实体；附带需要入队的疑似重复审核对
@@ -386,7 +387,11 @@ async fn resolve_by_name(
                  WHERE f.kb_id = e.kb_id AND (f.subject_id = e.id OR f.object_id = e.id)
                    AND f.invalidated_at IS NULL AND {not_name}) AS degree,
                 (lower(e.canonical_name) = ANY($4) OR {exact_named}) AS exact_name,
-                e.type_id IS NOT DISTINCT FROM $2 AS same_type
+                e.type_id IS NOT DISTINCT FROM $2 AS same_type,
+                EXISTS (SELECT 1 FROM resolution_reviews rv
+                         WHERE rv.kb_id = e.kb_id AND rv.left_id = e.id
+                           AND rv.status = 'pending' AND rv.stage = 'human'
+                           AND rv.reason LIKE 'namesake_tie|%') AS unresolved
          FROM entities e
          -- IS NOT DISTINCT FROM 而不是 =（0009 的那个陷阱）：开放图谱里的实体都没有类
          -- （类由对齐来定），`type_id = NULL` 永远不成立，同名的它就永远撞不上——
@@ -418,7 +423,11 @@ async fn resolve_by_name(
     // 名字事实也算：两个不同 canonical_name 都可能被原文叫作「张伟」。
     // 未绑定的类别词不能过滤已分类的同名人；否则一个尚未分类的工程师会
     // 成为唯一候选，原文中的财务总监连旁证这一关都进不来。
-    let namesakes: Vec<_> = candidates.iter().filter(|c| c.exact_name).collect();
+    // 待人分配的提及不是第三个已知同名者；它积累的事实也不能拿来猜身份。
+    let namesakes: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.exact_name && !c.unresolved)
+        .collect();
     if namesakes.len() > 1 {
         if let Some(t) = text {
             if let Some(c) = corroborating_candidate(pool, kb_id, &namesakes, t).await? {
@@ -434,38 +443,43 @@ async fn resolve_by_name(
                 });
             }
         }
-        // 锁内同名回捞也得排除这些候选，否则刚决定不猜，又在建实体时猜回去。
+        let reviews: Vec<_> = namesakes
+            .into_iter()
+            .map(|c| {
+                let score = context
+                    .and_then(|ctx| {
+                        c.profile_embedding
+                            .as_ref()
+                            .and_then(|p| cosine(p.as_slice(), ctx))
+                    })
+                    .unwrap_or(1.0);
+                ReviewRequest {
+                    other_id: c.id,
+                    score,
+                    reason: format!("namesake_tie|{score:.2}"),
+                    stage: ReviewStage::Human,
+                }
+            })
+            .collect();
+        // 排除已知候选，复用同名未决项；否则每篇文档再生一个未决者，审核对平方增长。
         let weighed: Vec<_> = exclude
             .iter()
             .copied()
-            .chain(candidates.iter().map(|c| c.id))
+            .chain(candidates.iter().filter(|c| !c.unresolved).map(|c| c.id))
             .collect();
-        let (id, created) = create_entity(pool, kb_id, type_id, &name, context, &weighed).await?;
+        let (id, created) = create_entity(
+            pool,
+            kb_id,
+            type_id,
+            &name,
+            context,
+            &weighed,
+            Some(&reviews),
+        )
+        .await?;
         if created {
             refresh_disambiguators(pool, kb_id, &name).await?;
         }
-        let reviews = if created {
-            namesakes
-                .into_iter()
-                .map(|c| {
-                    let score = context
-                        .and_then(|ctx| {
-                            c.profile_embedding
-                                .as_ref()
-                                .and_then(|p| cosine(p.as_slice(), ctx))
-                        })
-                        .unwrap_or(1.0);
-                    ReviewRequest {
-                        other_id: c.id,
-                        score,
-                        reason: format!("namesake_tie|{score:.2}"),
-                        stage: ReviewStage::Human,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         return Ok(Resolution {
             entity_id: id,
             created,
@@ -558,7 +572,7 @@ async fn resolve_by_name(
                     }
                 }
                 let (id, created) =
-                    create_entity(pool, kb_id, type_id, &name, context, &weighed).await?;
+                    create_entity(pool, kb_id, type_id, &name, context, &weighed, None).await?;
                 if !created {
                     // 并行的另一份文档刚建好它：用它的，审核对也是它排的
                     return Ok(Resolution {
@@ -622,7 +636,7 @@ async fn resolve_by_name(
             });
         }
     }
-    let (id, created) = create_entity(pool, kb_id, type_id, &name, context, &weighed).await?;
+    let (id, created) = create_entity(pool, kb_id, type_id, &name, context, &weighed, None).await?;
     if !created {
         // 并行的另一份文档刚建好它：用它的，审核对也是它排的
         return Ok(Resolution {
@@ -1124,7 +1138,7 @@ async fn resolve_type_drift(
         .copied()
         .chain(cross.iter().map(|c| c.id))
         .collect();
-    let (id, created) = create_entity(pool, kb_id, type_id, name, context, &weighed).await?;
+    let (id, created) = create_entity(pool, kb_id, type_id, name, context, &weighed, None).await?;
     if !created {
         // 并行的另一份文档刚建好它：用它的，审核对也是它排的
         return Ok(Resolution {
@@ -1188,60 +1202,115 @@ async fn create_entity(
     // 替人把 mention 归到其中一个身上。同名并列那条路上这正是 #270 禁的事：
     // 分不开就别硬分，谁也不归，两个都送审。
     weighed: &[Uuid],
+    unresolved_reviews: Option<&[ReviewRequest]>,
 ) -> AppResult<(Uuid, bool)> {
     // 名字属性在锁外取：它自己有一次插入，放进锁里会让所有建实体的人排同一把队
     let known_as = crate::names::ensure_known_as(pool, kb_id).await?;
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
         .bind(kb_id.to_string())
-        .bind(name)
+        .bind(if unresolved_reviews.is_some() {
+            name.to_lowercase()
+        } else {
+            name.to_string()
+        })
         .execute(&mut *tx)
         .await?;
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        // 被描述的东西不算「同名的它」（0044）：它的 canonical_name 只是显示用的描述
-        "SELECT id FROM entities
+    let existing: Option<(Uuid,)> = if unresolved_reviews.is_some() {
+        // pending 的人工 namesake 对标识未决项。合并后或人已裁完的实体不再是桶。
+        sqlx::query_as(
+            "SELECT e.id FROM entities e
+             WHERE e.kb_id = $1 AND lower(e.canonical_name) = lower($2)
+               AND (e.type_id IS NOT DISTINCT FROM $3 OR e.type_id IS NULL OR $3::uuid IS NULL)
+               AND e.merged_into IS NULL AND e.description IS NULL AND e.id <> ALL($4)
+               AND EXISTS (SELECT 1 FROM resolution_reviews rv
+                            WHERE rv.kb_id = e.kb_id AND rv.left_id = e.id
+                              AND rv.status = 'pending' AND rv.stage = 'human'
+                              AND rv.reason LIKE 'namesake_tie|%')
+             ORDER BY e.id LIMIT 1",
+        )
+        .bind(kb_id)
+        .bind(name)
+        .bind(type_id)
+        .bind(weighed)
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as(
+            // 被描述的东西不算「同名的它」（0044）：它的 canonical_name 只是显示用的描述
+            "SELECT id FROM entities
          WHERE kb_id = $1 AND canonical_name = $2 AND type_id IS NOT DISTINCT FROM $3
            AND merged_into IS NULL AND description IS NULL AND id <> ALL($4)
          ORDER BY id LIMIT 1",
-    )
-    .bind(kb_id)
-    .bind(name)
-    .bind(type_id)
-    .bind(weighed)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some((id,)) = existing {
-        tx.commit().await?;
-        return Ok((id, false));
-    }
-    let id = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO entities (id, kb_id, type_id, canonical_name, profile_embedding, profile_n)
-         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(id)
-    .bind(kb_id)
-    .bind(type_id)
-    .bind(name)
-    .bind(context.map(|c| Vector::from(c.to_vec())))
-    .bind(i32::from(context.is_some()))
-    .execute(&mut *tx)
-    .await?;
-    // 与实体同一个事务：召回按名字事实找它，建出来却查不到名字的那一瞬间不能有。
-    // 出处（哪一块、哪句话）由抽取随后给这条事实补证据
-    sqlx::query(
-        "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_value)
+        )
+        .bind(kb_id)
+        .bind(name)
+        .bind(type_id)
+        .bind(weighed)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
+    let created = existing.is_none();
+    let id = if let Some((id,)) = existing {
+        id
+    } else {
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO entities (id, kb_id, type_id, canonical_name, profile_embedding, profile_n)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(kb_id)
+        .bind(type_id)
+        .bind(name)
+        .bind(context.map(|c| Vector::from(c.to_vec())))
+        .bind(i32::from(context.is_some()))
+        .execute(&mut *tx)
+        .await?;
+        // 与实体同一个事务：召回按名字事实找它，建出来却查不到名字的那一瞬间不能有。
+        // 出处（哪一块、哪句话）由抽取随后给这条事实补证据
+        sqlx::query(
+            "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_value)
          VALUES ($1, $2, $3, $4, jsonb_build_object('value', $5::text))",
-    )
-    .bind(Uuid::now_v7())
-    .bind(kb_id)
-    .bind(id)
-    .bind(known_as)
-    .bind(name)
-    .execute(&mut *tx)
-    .await?;
+        )
+        .bind(Uuid::now_v7())
+        .bind(kb_id)
+        .bind(id)
+        .bind(known_as)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        id
+    };
+    if let Some(reviews) = unresolved_reviews {
+        // 标记与实体同事务：并行文档不能看见「新建但还没入审核」的桶再生一个。
+        // 返回给调用方的审核请求仍保留，原有 pending 唯一索引使再入队幂等。
+        for rv in reviews {
+            sqlx::query(
+                "INSERT INTO resolution_reviews AS existing
+                     (id, kb_id, left_id, right_id, score, reason, stage)
+                 SELECT $1, $2, $3, $4, $5, $6, 'human'
+                 WHERE NOT EXISTS (SELECT 1 FROM resolution_reviews kept
+                                    WHERE kept.kb_id = $2 AND kept.status = 'kept'
+                                      AND least(kept.left_id, kept.right_id) = least($3, $4)
+                                      AND greatest(kept.left_id, kept.right_id) = greatest($3, $4))
+                 ON CONFLICT (kb_id, least(left_id, right_id), greatest(left_id, right_id))
+                     WHERE status = 'pending'
+                 DO UPDATE SET stage = 'human', reason = EXCLUDED.reason
+                   WHERE existing.stage = 'adjudicating'",
+            )
+            .bind(Uuid::now_v7())
+            .bind(kb_id)
+            .bind(id)
+            .bind(rv.other_id)
+            .bind(rv.score)
+            .bind(&rv.reason)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     tx.commit().await?;
-    Ok((id, true))
+    Ok((id, created))
 }
 
 /// 一个被描述、没有名字的东西（0044 第一刀，#729）："the buyer's parent company"、
