@@ -391,7 +391,11 @@ async fn resolve_by_name(
                 EXISTS (SELECT 1 FROM resolution_reviews rv
                          WHERE rv.kb_id = e.kb_id AND rv.left_id = e.id
                            AND rv.status = 'pending' AND rv.stage = 'human'
-                           AND rv.reason LIKE 'namesake_tie|%') AS unresolved
+                           AND rv.reason LIKE 'namesake_tie|%'
+                           AND rv.reason NOT LIKE '%|redirected%'
+                           AND NOT EXISTS (SELECT 1 FROM entity_merges m
+                                            WHERE m.kb_id = e.kb_id AND m.target_id = e.id
+                                              AND m.reverted_at IS NULL)) AS unresolved
          FROM entities e
          -- IS NOT DISTINCT FROM 而不是 =（0009 的那个陷阱）：开放图谱里的实体都没有类
          -- （类由对齐来定），`type_id = NULL` 永远不成立，同名的它就永远撞不上——
@@ -1217,7 +1221,8 @@ async fn create_entity(
         .execute(&mut *tx)
         .await?;
     let existing: Option<(Uuid,)> = if unresolved_reviews.is_some() {
-        // pending 的人工 namesake 对标识未决项。合并后或人已裁完的实体不再是桶。
+        // pending 的人工 namesake 对标识未决项。合并后或人已裁完的实体不再是桶；
+        // 合并会把其它 pending 对转给存活者，不能因此把已确认的人误认成未决项。
         sqlx::query_as(
             "SELECT e.id FROM entities e
              WHERE e.kb_id = $1 AND lower(e.canonical_name) = lower($2)
@@ -1226,7 +1231,11 @@ async fn create_entity(
                AND EXISTS (SELECT 1 FROM resolution_reviews rv
                             WHERE rv.kb_id = e.kb_id AND rv.left_id = e.id
                               AND rv.status = 'pending' AND rv.stage = 'human'
-                              AND rv.reason LIKE 'namesake_tie|%')
+                              AND rv.reason LIKE 'namesake_tie|%'
+                              AND rv.reason NOT LIKE '%|redirected%'
+                              AND NOT EXISTS (SELECT 1 FROM entity_merges m
+                                               WHERE m.kb_id = e.kb_id AND m.target_id = e.id
+                                                 AND m.reverted_at IS NULL))
              ORDER BY e.id LIMIT 1",
         )
         .bind(kb_id)

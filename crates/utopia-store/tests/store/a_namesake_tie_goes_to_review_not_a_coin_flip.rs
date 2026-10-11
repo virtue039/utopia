@@ -458,3 +458,46 @@ async fn parallel_mentions_do_not_create_two_unresolved_entities() -> anyhow::Re
         .await?;
     run
 }
+
+#[tokio::test]
+async fn a_merged_namesake_is_no_longer_unresolved() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    for bucket_survives in [false, true] {
+        let f = seed(&pool).await?;
+        let run = async {
+            let r = utopia_store::resolution::resolve_mention(
+                &pool, f.kb, Some(f.person), "Zhang Wei", None, None,
+                Some("Zhang Wei received an award."), &[],
+            ).await?;
+            let review: Uuid = sqlx::query_scalar(
+                "SELECT id FROM resolution_reviews WHERE kb_id = $1 AND left_id = $2 AND right_id = $3 AND status = 'pending'",
+            ).bind(f.kb).bind(r.entity_id).bind(f.zhang_a).fetch_one(&pool).await?;
+            let (source, target) = if bucket_survives { (f.zhang_a, r.entity_id) } else { (r.entity_id, f.zhang_a) };
+            utopia_store::resolution::merge_entities(&pool, f.kb, source, target, None, "review fixture").await?;
+            utopia_store::resolution::close_review_auto(&pool, review, "merged", "review fixture").await?;
+            // One namesake review remains (redirected if the bucket was the source).
+            // It must not hide the now-identified survivor from the ambiguity guard.
+            let next = utopia_store::resolution::resolve_mention(
+                &pool, f.kb, Some(f.person), "Zhang Wei", None, None,
+                Some("Zhang Wei received an award."), &[],
+            ).await?;
+            assert!(next.created, "merged survivor is known, not an unresolved bucket");
+            assert!(![target, f.zhang_b].contains(&next.entity_id));
+            let placed = utopia_store::resolution::resolve_mention(
+                &pool, f.kb, Some(f.person), "Zhang Wei", None, None,
+                Some("Zhang Wei of Platform Engineering received an award."), &[],
+            ).await?;
+            assert_eq!(placed.entity_id, target);
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(f.org)
+            .execute(&pool)
+            .await?;
+        run?;
+    }
+    Ok(())
+}
