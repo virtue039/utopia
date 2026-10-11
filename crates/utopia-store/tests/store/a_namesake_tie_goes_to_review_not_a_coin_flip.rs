@@ -376,6 +376,43 @@ async fn a_namesakes_fact_outweighs_a_higher_topic_score() -> anyhow::Result<()>
 
 // Every call can be a new document: an unresolved mention is not a third known namesake.
 #[tokio::test]
+async fn a_governance_kept_ambiguity_still_reuses_the_unresolved_namesake() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+    let result = async {
+        sqlx::query("UPDATE entities SET canonical_name='Zhang Wei' WHERE id IN ($1,$2)").bind(f.zhang_a).bind(f.zhang_b).execute(&pool).await?;
+        let first = utopia_store::resolution::resolve_mention(&pool, f.kb, Some(f.person), "Zhang Wei", None, None, Some("Zhang Wei received an award."), &[]).await?;
+        let reviews: Vec<(Uuid,String)> = sqlx::query_as("SELECT id,reason FROM resolution_reviews WHERE kb_id=$1 AND stage='human' AND status='pending'").bind(f.kb).fetch_all(&pool).await?;
+        assert_eq!(reviews.len(), 2);
+        for (id, original) in reviews {
+            // Governance preserves which side was unresolved when it closes review work.
+            let reason = format!("kept_apart|no_checkable_identity_evidence|unresolved_namesake_left|{original}");
+            utopia_store::resolution::close_review_auto(&pool, id, "kept", &reason).await?;
+        }
+        for _ in 0..20 {
+            let next = utopia_store::resolution::resolve_mention(&pool, f.kb, Some(f.person), "Zhang Wei", None, None, Some("Zhang Wei received another award."), &[]).await?;
+            assert_eq!(next.entity_id, first.entity_id, "keeping apart cannot make an unresolved mention into an identified person");
+            for rv in &next.reviews {
+                // Exercise the real caller too, not just create_entity's atomic insertion.
+                utopia_store::resolution::create_review(&pool, f.kb, next.entity_id, rv.other_id, rv.score, &rv.reason, rv.stage).await?;
+            }
+        }
+        let entities: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE kb_id=$1 AND merged_into IS NULL AND lower(canonical_name)='zhang wei'").bind(f.kb).fetch_one(&pool).await?;
+        let human: i64 = sqlx::query_scalar("SELECT count(*) FROM resolution_reviews WHERE kb_id=$1 AND stage='human' AND status='pending'").bind(f.kb).fetch_one(&pool).await?;
+        assert_eq!((entities,human),(3,0));
+        Ok(())
+    }.await;
+    sqlx::query("DELETE FROM organizations WHERE id=$1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    result
+}
+
+#[tokio::test]
 async fn recurring_ambiguous_mentions_share_one_unresolved_entity() -> anyhow::Result<()> {
     let Some(url) = utopia_store::test_db::url() else {
         return Ok(());

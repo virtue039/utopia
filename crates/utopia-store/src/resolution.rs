@@ -390,8 +390,10 @@ async fn resolve_by_name(
                 e.type_id IS NOT DISTINCT FROM $2 AS same_type,
                 EXISTS (SELECT 1 FROM resolution_reviews rv
                          WHERE rv.kb_id = e.kb_id AND rv.left_id = e.id
-                           AND rv.status = 'pending' AND rv.stage = 'human'
-                           AND rv.reason LIKE 'namesake_tie|%'
+                           AND rv.stage = 'human'
+                           AND ((rv.status = 'pending' AND rv.reason LIKE 'namesake_tie|%')
+                             OR (rv.status = 'kept' AND rv.decided_by IS NULL AND starts_with(rv.reason,
+                                 'kept_apart|no_checkable_identity_evidence|unresolved_namesake_left|namesake_tie|')))
                            AND rv.reason NOT LIKE '%|redirected%'
                            AND NOT EXISTS (SELECT 1 FROM entity_merges m
                                             WHERE m.kb_id = e.kb_id AND m.target_id = e.id
@@ -1221,7 +1223,8 @@ async fn create_entity(
         .execute(&mut *tx)
         .await?;
     let existing: Option<(Uuid,)> = if unresolved_reviews.is_some() {
-        // pending 的人工 namesake 对标识未决项。合并后或人已裁完的实体不再是桶；
+        // pending 的人工 namesake 对，或机器因无身份证据而 kept 的左角色，仍是未决项。
+        // 人已裁完的实体不再是桶；
         // 合并会把其它 pending 对转给存活者，不能因此把已确认的人误认成未决项。
         sqlx::query_as(
             "SELECT e.id FROM entities e
@@ -1230,8 +1233,10 @@ async fn create_entity(
                AND e.merged_into IS NULL AND e.description IS NULL AND e.id <> ALL($4)
                AND EXISTS (SELECT 1 FROM resolution_reviews rv
                             WHERE rv.kb_id = e.kb_id AND rv.left_id = e.id
-                              AND rv.status = 'pending' AND rv.stage = 'human'
-                              AND rv.reason LIKE 'namesake_tie|%'
+                              AND rv.stage = 'human'
+                              AND ((rv.status = 'pending' AND rv.reason LIKE 'namesake_tie|%')
+                                OR (rv.status = 'kept' AND rv.decided_by IS NULL AND starts_with(rv.reason,
+                                    'kept_apart|no_checkable_identity_evidence|unresolved_namesake_left|namesake_tie|')))
                               AND rv.reason NOT LIKE '%|redirected%'
                               AND NOT EXISTS (SELECT 1 FROM entity_merges m
                                                WHERE m.kb_id = e.kb_id AND m.target_id = e.id
@@ -1537,6 +1542,8 @@ pub async fn refresh_disambiguators(pool: &PgPool, kb_id: Uuid, name: &str) -> A
 // ---------------------------------------------------------------------------
 
 /// 灰区疑似重复对入队（同一 pending 对幂等）。
+/// An evidence-gated keep closes work, not the unresolved left identity. Repeated
+/// ambiguity must not reopen it; a later adjudicating proposal may bring new evidence.
 pub async fn create_review(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1549,7 +1556,14 @@ pub async fn create_review(
     sqlx::query(
         "INSERT INTO resolution_reviews AS existing
              (id, kb_id, left_id, right_id, score, reason, stage)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         SELECT $1, $2, $3, $4, $5, $6, $7
+         WHERE NOT EXISTS (SELECT 1 FROM resolution_reviews kept
+                            WHERE $7 = 'human' AND starts_with($6, 'namesake_tie|')
+                              AND kept.kb_id = $2 AND kept.left_id = $3 AND kept.right_id = $4
+                              AND kept.status = 'kept' AND kept.stage = 'human' AND kept.decided_by IS NULL
+                              AND starts_with(kept.reason,
+                                  'kept_apart|no_checkable_identity_evidence|unresolved_namesake_left|namesake_tie|')
+                              AND kept.reason NOT LIKE '%|redirected%')
          ON CONFLICT (kb_id, least(left_id, right_id), greatest(left_id, right_id))
              WHERE status = 'pending'
          DO UPDATE SET stage = 'human', reason = EXCLUDED.reason
