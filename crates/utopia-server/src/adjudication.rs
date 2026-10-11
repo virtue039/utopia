@@ -87,6 +87,21 @@ pub(crate) const SECOND_LOOK_UNAVAILABLE: &str = "escalate_unsure|second_look_un
 
 pub(crate) const NO_IDENTITY_EVIDENCE: &str = "kept_apart|no_checkable_identity_evidence";
 
+pub(crate) fn no_identity_reason(item: &ReviewItem) -> String {
+    match item.reason.as_deref() {
+        Some(reason)
+            if item.stage == "human"
+                && reason.starts_with("namesake_tie|")
+                && !reason.contains("|redirected") =>
+        {
+            // Left is the unresolved mention, not an identified namesake. Keeping
+            // it apart closes review work without inventing an identity for it.
+            format!("{NO_IDENTITY_EVIDENCE}|unresolved_namesake_left|{reason}")
+        }
+        _ => NO_IDENTITY_EVIDENCE.into(),
+    }
+}
+
 /// 一次裁决落地成了什么：第二层的行按它记 applied 还是 proposed
 enum Outcome {
     Merged(Uuid),
@@ -106,6 +121,7 @@ async fn record_look(
     outcome: &Outcome,
 ) -> anyhow::Result<()> {
     let evidence_held = matches!(outcome, Outcome::Kept) && look.same == Some(true);
+    let held_reason = evidence_held.then(|| no_identity_reason(item));
     let action = match look.same {
         Some(true) if evidence_held => "keep",
         Some(true) => "merge",
@@ -125,11 +141,7 @@ async fn record_look(
             target_id: item.id,
             action,
             confidence: look.conf,
-            reason: if evidence_held {
-                Some(NO_IDENTITY_EVIDENCE)
-            } else {
-                look.why.as_deref()
-            },
+            reason: held_reason.as_deref().or(look.why.as_deref()),
             precedents: gov::precedents_json(p),
             status,
             merge_id,
@@ -402,13 +414,9 @@ async fn apply_verdict(
             None => {
                 // Keeping is reversible and does not turn one missing identity
                 // link into another item in the human queue (#1193).
-                utopia_store::resolution::close_review_auto(
-                    &state.pool,
-                    item.id,
-                    "kept",
-                    NO_IDENTITY_EVIDENCE,
-                )
-                .await?;
+                let reason = no_identity_reason(item);
+                utopia_store::resolution::close_review_auto(&state.pool, item.id, "kept", &reason)
+                    .await?;
                 let _ = utopia_store::audit::record_opt(
                     &state.pool,
                     Some(kb_id),
@@ -419,7 +427,7 @@ async fn apply_verdict(
                     serde_json::json!({
                         "left": item.left.name, "right": item.right.name,
                         "score": item.score, "confidence": conf, "via": via,
-                        "why": why, "model_same": true, "reason": NO_IDENTITY_EVIDENCE,
+                        "why": why, "model_same": true, "reason": reason,
                     }),
                 )
                 .await;
@@ -729,21 +737,26 @@ mod tests {
                     sqlx::query("UPDATE chunks SET text='张伟任职于 Acme。' WHERE id=ANY($1)").bind(f.chunks.as_slice()).execute(&f.state.pool).await?;
                     sqlx::query("UPDATE fact_evidence SET quote='张伟任职于 Acme。' WHERE fact_id=ANY($1)").bind(f.facts.as_slice()).execute(&f.state.pool).await?;
                 }
-                let it = f.item().await?;
+                let mut it = f.item().await?;
+                if !unique {
+                    it.stage = "human".into();
+                    it.reason = Some("namesake_tie|0.85".into());
+                    sqlx::query("UPDATE resolution_reviews SET stage='human', reason='namesake_tie|0.85' WHERE id=$1").bind(it.id).execute(&f.state.pool).await?;
+                }
                 let outcome = apply_verdict(&f.state, f.kb, &it, Some(true), 0.99, "adjudicated", Some("nothing contradicts")).await?;
                 assert_eq!(matches!(outcome, Outcome::Merged(_)), unique);
                 let (status, reason, human): (String, String, i64) = sqlx::query_as("SELECT status, reason, (SELECT count(*) FROM resolution_reviews WHERE kb_id=$2 AND status='pending' AND stage='human') FROM resolution_reviews WHERE id=$1").bind(it.id).bind(f.kb).fetch_one(&f.state.pool).await?;
                 assert_eq!(human, 0);
                 if unique { assert_eq!(status, "merged"); assert!(reason.contains("identity_evidence|facts=")); }
                 else {
-                    assert_eq!(status, "kept"); assert_eq!(reason, NO_IDENTITY_EVIDENCE);
+                    assert_eq!(status, "kept"); assert_eq!(reason, format!("{NO_IDENTITY_EVIDENCE}|unresolved_namesake_left|namesake_tie|0.85"));
                     let detail: serde_json::Value = sqlx::query_scalar("SELECT detail FROM audit_events WHERE target_id=$1 AND action='review.keep'").bind(it.id).fetch_one(&f.state.pool).await?;
-                    assert_eq!(detail["reason"], NO_IDENTITY_EVIDENCE);
+                    assert_eq!(detail["reason"], reason);
                     assert_eq!(detail["model_same"], true);
                     let look = Look::from_batch(Some(true), 0.99, Some("nothing contradicts".into()));
                     record_look(&f.state, f.kb, Uuid::now_v7(), &it, &gov::Precedents::default(), &look, &outcome).await?;
                     let row: (String,String,String) = sqlx::query_as("SELECT action,status,reason FROM agent_decisions WHERE target_id=$1").bind(it.id).fetch_one(&f.state.pool).await?;
-                    assert_eq!(row, ("keep".into(), "applied".into(), NO_IDENTITY_EVIDENCE.into()));
+                    assert_eq!(row, ("keep".into(), "applied".into(), no_identity_reason(&it)));
                 }
                 Ok(())
             }.await;

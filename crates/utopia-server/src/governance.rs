@@ -584,17 +584,18 @@ async fn apply(ctx: &Ctx<'_>, item: &ReviewItem, p: &Precedents, look: Look) -> 
                         reason.push_str(&proof);
                     }
                     None => {
-                        let why = crate::adjudication::NO_IDENTITY_EVIDENCE;
-                        let closed =
-                            utopia_store::resolution::close_review_auto(pool, item.id, "kept", why)
-                                .await?;
+                        let why = crate::adjudication::no_identity_reason(item);
+                        let closed = utopia_store::resolution::close_review_auto(
+                            pool, item.id, "kept", &why,
+                        )
+                        .await?;
                         if closed > 0 {
                             let id = gov::record(
                                 pool,
                                 kb_id,
                                 NewDecision {
                                     action: "keep",
-                                    reason: Some(why),
+                                    reason: Some(&why),
                                     ..decision("applied", None)
                                 },
                             )
