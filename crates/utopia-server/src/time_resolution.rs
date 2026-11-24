@@ -135,11 +135,11 @@ fn shift(t: DateTime<Utc>, offset: &Offset) -> Option<DateTime<Utc>> {
         Unit::Year => months(count.checked_mul(12)?),
         Unit::Quarter => months(count.checked_mul(3)?),
         Unit::Month => months(count),
-        Unit::Week => span(Duration::weeks(i64::try_from(count).ok()?)),
-        Unit::Day => span(Duration::days(i64::try_from(count).ok()?)),
-        Unit::Hour => span(Duration::hours(i64::try_from(count).ok()?)),
-        Unit::Minute => span(Duration::minutes(i64::try_from(count).ok()?)),
-        Unit::Second => span(Duration::seconds(i64::try_from(count).ok()?)),
+        Unit::Week => span(Duration::try_weeks(i64::try_from(count).ok()?)?),
+        Unit::Day => span(Duration::try_days(i64::try_from(count).ok()?)?),
+        Unit::Hour => span(Duration::try_hours(i64::try_from(count).ok()?)?),
+        Unit::Minute => span(Duration::try_minutes(i64::try_from(count).ok()?)?),
+        Unit::Second => span(Duration::try_seconds(i64::try_from(count).ok()?)?),
     }
 }
 
@@ -1305,6 +1305,38 @@ mod tests {
         // 没有文档日期就锚不到
         let undated = DocumentDating::default();
         assert_eq!(resolve_one(&today, &undated, &HashMap::new()), UNRESOLVED);
+    }
+
+    #[test]
+    fn an_unrepresentable_relative_offset_stays_unresolved() {
+        let context = ctx_dated(2026, 9, 2);
+        let earlier = HashMap::new();
+        for unit in [
+            Unit::Week,
+            Unit::Day,
+            Unit::Hour,
+            Unit::Minute,
+            Unit::Second,
+        ] {
+            let interpretation = Interpretation {
+                id: 0,
+                shape: Shape::Point,
+                reference: Reference::Anchored {
+                    anchor: Anchor::Document,
+                    offset: Some(Offset {
+                        count: i64::MAX,
+                        unit,
+                        direction: Direction::After,
+                    }),
+                },
+                granularity: Granularity::Day,
+            };
+            assert_eq!(
+                resolve_one(&interpretation, &context, &earlier),
+                UNRESOLVED,
+                "{unit:?}"
+            );
+        }
     }
 
     #[test]
