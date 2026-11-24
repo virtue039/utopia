@@ -13,6 +13,7 @@
 use crate::provenance::{Origin, Provenance, Segment};
 use crate::reading::{Place, Reading, Region};
 use crate::{NoSpeakers, Unreadable};
+use anyhow::Context;
 use serde_json::{json, Value};
 
 /// 读转写结果。有一句带字却没有说话人，整份拒收
@@ -24,7 +25,7 @@ pub fn reading(response: &Value, model: &str) -> anyhow::Result<Reading> {
     let mut text = String::new();
     let mut regions: Vec<Region> = Vec::new();
     let mut last_speaker: Option<String> = None;
-    for seg in segments {
+    for (index, seg) in segments.iter().enumerate() {
         let said = crate::mineru::without_nul(seg["text"].as_str().unwrap_or_default());
         let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
         if said.is_empty() {
@@ -35,6 +36,15 @@ pub fn reading(response: &Value, model: &str) -> anyhow::Result<Reading> {
             Value::Number(n) => n.to_string(),
             _ => return Err(NoSpeakers.into()),
         };
+        let number = index + 1;
+        let start_ms = millis(&seg["start"])
+            .with_context(|| format!("Transcription segment {number} has an invalid start time"))?;
+        let end_ms = millis(&seg["end"])
+            .with_context(|| format!("Transcription segment {number} has an invalid end time"))?;
+        anyhow::ensure!(
+            end_ms >= start_ms,
+            "Transcription segment {number} ends before it starts"
+        );
         let start = text.len();
         if last_speaker.as_deref() == Some(speaker.as_str()) {
             text.push(' ');
@@ -48,8 +58,8 @@ pub fn reading(response: &Value, model: &str) -> anyhow::Result<Reading> {
         regions.push(Region {
             range: start..text.len(),
             place: Place::Time {
-                start_ms: millis(&seg["start"]),
-                end_ms: millis(&seg["end"]),
+                start_ms: start_ms.round() as u64,
+                end_ms: end_ms.round() as u64,
                 speaker: speaker.clone(),
             },
         });
@@ -92,8 +102,10 @@ pub fn reading(response: &Value, model: &str) -> anyhow::Result<Reading> {
     })
 }
 
-fn millis(v: &Value) -> u64 {
-    (v.as_f64().unwrap_or(0.0).max(0.0) * 1000.0).round() as u64
+fn millis(v: &Value) -> Option<f64> {
+    let seconds = v.as_f64()?;
+    let millis = seconds * 1000.0;
+    (seconds >= 0.0 && millis.round() < u64::MAX as f64).then_some(millis)
 }
 
 #[cfg(test)]
@@ -151,6 +163,27 @@ mod tests {
                 .unwrap()
                 >= 5300
         );
+    }
+
+    #[test]
+    fn an_invalid_segment_time_cannot_become_a_citation() {
+        for (field, value, problem) in [
+            ("start", Value::Null, "invalid start"),
+            ("end", json!(2.3999), "ends before"),
+            ("start", json!(-0.2), "invalid start"),
+            ("end", json!("5.1"), "invalid end"),
+        ] {
+            let mut input = meeting();
+            let segment = &mut input["segments"][1];
+            if value.is_null() {
+                segment.as_object_mut().unwrap().remove(field);
+            } else {
+                segment[field] = value;
+            }
+            let message = reading(&input, "model").unwrap_err().to_string();
+            assert!(message.contains("segment 2"), "{message}");
+            assert!(message.contains(problem), "{message}");
+        }
     }
 
     #[test]
