@@ -52,9 +52,14 @@ export function DocViewer() {
     return map;
   }, [extractions.data]);
 
-  // null = 自动定位：有引用跳转时翻到目标分块所在页
-  const [page, setPage] = useState<number | null>(null);
-  useEffect(() => setPage(null), [chunk, docId]);
+  // 引用目标变了就要在本次渲染选中对应页，提交后滚动的 effect 才拿得到目标行。
+  const citation = JSON.stringify([docId, chunk, quote]);
+  const [pagination, setPagination] = useState<{ citation: string; page: number | null }>({
+    citation,
+    page: null,
+  });
+  const page = pagination.citation === citation ? pagination.page : null;
+  if (pagination.citation !== citation) setPagination({ citation, page: null });
   useEffect(() => setCaseStatement(null), [docId]);
 
   const highlightRef = useRef<HTMLDivElement>(null);
@@ -68,7 +73,8 @@ export function DocViewer() {
       const t = setTimeout(() => setFlash(false), 2600);
       return () => clearTimeout(t);
     }
-  }, [detail.data, chunk]);
+    setFlash(false);
+  }, [detail.data, citation]);
 
   if (detail.isPending)
     return <div className="p-8 text-body text-ink-2">{S.doc.loading}</div>;
@@ -216,7 +222,12 @@ export function DocViewer() {
             );
           })}
         </div>
-          <Pager total={chunks.length} pageSize={DOC_PAGE} page={safePage} onPage={setPage} />
+          <Pager
+            total={chunks.length}
+            pageSize={DOC_PAGE}
+            page={safePage}
+            onPage={(page) => setPagination({ citation, page })}
+          />
         </div>
       </div>
       {caseStatement && (
