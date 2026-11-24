@@ -2,7 +2,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import { api, type User } from "./api";
 import { liveAnswer } from "./liveAnswer";
 import { convMarks } from "./unread";
-import { kbStore, wsStore } from "./wsStore";
+import { kbStore, withLocalStorage, wsStore } from "./wsStore";
 
 /** 同标签页记忆：上次会话（按库）与未发送草稿——切页回来还原，新标签页从头开始 */
 const LAST_PREFIX = "chat:last:";
@@ -15,16 +15,28 @@ export const DRAFT_KEY = "chat:draft";
  *  仍要认出自己的草稿是上一个人的。只记在 sessionStorage 也不行：新开的标签页是空的，
  *  同一个人每开一个标签页就要清一次未读和所选的库。 */
 const OWNER_KEY = "utopia.account";
+let tabOwnerInMemory: string | undefined;
+let sharedOwnerInMemory: string | undefined;
+
+function withSessionStorage<T>(access: (storage: Storage) => T): T | undefined {
+  try {
+    return access(sessionStorage);
+  } catch {
+    return undefined;
+  }
+}
 
 /** 这个标签页自己的：回答活得比页面长（liveAnswer），草稿和上次会话活得过刷新 */
 function clearTab() {
   liveAnswer.clear();
-  sessionStorage.removeItem(DRAFT_KEY);
-  // 倒着走：删掉一个键，后面的下标会前移
-  for (let i = sessionStorage.length - 1; i >= 0; i--) {
-    const key = sessionStorage.key(i);
-    if (key?.startsWith(LAST_PREFIX)) sessionStorage.removeItem(key);
-  }
+  withSessionStorage((storage) => {
+    storage.removeItem(DRAFT_KEY);
+    // 倒着走：删掉一个键，后面的下标会前移
+    for (let i = storage.length - 1; i >= 0; i--) {
+      const key = storage.key(i);
+      if (key?.startsWith(LAST_PREFIX)) storage.removeItem(key);
+    }
+  });
 }
 
 /** 各标签页共用的：未读记号和所选的库活得过关掉标签页。语言、主题不属于哪个人，不在其中。
@@ -41,10 +53,15 @@ function clearShared() {
  *  在随后取 `me` 时认出来；别的标签页里的登录，在这个标签页下次取 `me` 时（`me` 不过期，
  *  实际就是刷新时）认出来（见 fetchMe） */
 export function claimFor(userId: string) {
-  if (sessionStorage.getItem(OWNER_KEY) !== userId) clearTab();
-  if (localStorage.getItem(OWNER_KEY) !== userId) clearShared();
-  sessionStorage.setItem(OWNER_KEY, userId);
-  localStorage.setItem(OWNER_KEY, userId);
+  const tabOwner = withSessionStorage((storage) => storage.getItem(OWNER_KEY));
+  if ((tabOwner === undefined ? tabOwnerInMemory : tabOwner) !== userId) clearTab();
+  const owner = withLocalStorage((storage) => storage.getItem(OWNER_KEY));
+  // 共用存储不可读时，只信这个标签页已认领过的内存状态。
+  if ((owner === undefined ? sharedOwnerInMemory : owner) !== userId) clearShared();
+  tabOwnerInMemory = userId;
+  withSessionStorage((storage) => storage.setItem(OWNER_KEY, userId));
+  sharedOwnerInMemory = userId;
+  withLocalStorage((storage) => storage.setItem(OWNER_KEY, userId));
 }
 
 /** `me` 的取数：每次取到都先认一遍。Shell 等 `me` 回来才渲染子页面，
@@ -59,7 +76,9 @@ export async function fetchMe(): Promise<User> {
 export function clearSessionState(queryClient: QueryClient) {
   clearTab();
   clearShared();
-  sessionStorage.removeItem(OWNER_KEY);
-  localStorage.removeItem(OWNER_KEY);
+  tabOwnerInMemory = undefined;
+  withSessionStorage((storage) => storage.removeItem(OWNER_KEY));
+  sharedOwnerInMemory = undefined;
+  withLocalStorage((storage) => storage.removeItem(OWNER_KEY));
   queryClient.clear();
 }

@@ -2,7 +2,7 @@ import { Children, isValidElement, type ReactNode } from "react";
 import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api, type User } from "./api";
-import { fetchMe } from "./authSession";
+import { clearSessionState, fetchMe } from "./authSession";
 import { S } from "./i18n";
 import { liveAnswer, type LiveHandle } from "./liveAnswer";
 import { Login } from "./pages/Login";
@@ -42,6 +42,19 @@ class MemoryStorage {
   getItem(key: string) { return this.values.get(key) ?? null; }
   setItem(key: string, value: string) { this.values.set(key, value); }
   removeItem(key: string) { this.values.delete(key); }
+}
+
+function blockedStorage() {
+  const deny = () => {
+    throw new DOMException("Storage is blocked", "SecurityError");
+  };
+  return {
+    get length() { return deny(); },
+    key: deny,
+    getItem: deny,
+    setItem: deny,
+    removeItem: deny,
+  };
 }
 
 /** 元素树里按可见文字找到那个菜单项的回调 */
@@ -147,5 +160,62 @@ describe("a tab keeps a person's chat state only for that person", () => {
     await fetchMe();
     expectTabCleared();
     expect(kbStore.get()).toBe("next-users-kb");
+  });
+
+  it("keeps authentication and knowledge base selection usable with blocked storage", async () => {
+    await seedPreviousAccount();
+    vi.stubGlobal("localStorage", blockedStorage());
+    vi.spyOn(api, "me").mockResolvedValue({ id: "next-user" } as User);
+    await expect(fetchMe()).resolves.toMatchObject({ id: "next-user" });
+    expect(kbStore.get()).toBeNull();
+
+    const notified = vi.fn();
+    const unsubscribe = kbStore.subscribe(notified);
+    try {
+      kbStore.set("next-users-kb");
+      expect(notified).toHaveBeenCalledOnce();
+      await fetchMe();
+      expect(kbStore.get()).toBe("next-users-kb");
+    } finally {
+      unsubscribe();
+    }
+
+    clearSessionState(client);
+    expect(kbStore.get()).toBeNull();
+    expect(client.getQueryCache().getAll()).toEqual([]);
+  });
+
+  it("keeps the current tab usable when both storage areas are blocked", async () => {
+    await seedPreviousAccount();
+    vi.stubGlobal("localStorage", blockedStorage());
+    vi.stubGlobal("sessionStorage", blockedStorage());
+    vi.spyOn(api, "me").mockResolvedValue({ id: "next-user" } as User);
+
+    await expect(fetchMe()).resolves.toMatchObject({ id: "next-user" });
+    expect(liveAnswer.get()).toEqual([]);
+    expect(convMarks.unread().size).toBe(0);
+    expect(kbStore.get()).toBeNull();
+
+    wsStore.set("next-workspace");
+    kbStore.set("next-kb");
+    handles.push(liveAnswer.begin("next-kb", "next-conversation", [], () => {}));
+    await expect(fetchMe()).resolves.toMatchObject({ id: "next-user" });
+    expect(kbStore.get()).toBe("next-kb");
+    expect(liveAnswer.get()).toHaveLength(1);
+
+    expect(() => clearSessionState(client)).not.toThrow();
+    expect(liveAnswer.get()).toEqual([]);
+    expect(convMarks.unread().size).toBe(0);
+    expect(wsStore.get()).toBeNull();
+    expect(kbStore.get()).toBeNull();
+    expect(client.getQueryCache().getAll()).toEqual([]);
+  });
+
+  it("initializes selection stores when local storage cannot be read", async () => {
+    vi.stubGlobal("localStorage", blockedStorage());
+    vi.resetModules();
+    const stores = await import("./wsStore");
+    expect(stores.wsStore.get()).toBeNull();
+    expect(stores.kbStore.get()).toBeNull();
   });
 });
