@@ -254,6 +254,8 @@ export const zh: Strings = {
   },
   docs: {
     brand: "Utopia Charter",
+    ingestTopic: "摄入接口",
+    mcpTopic: "通过 MCP 使用智能体",
     backTitle: "返回 Utopia",
     searchPlaceholder: "搜索文档…",
     noResults: "没有匹配。",

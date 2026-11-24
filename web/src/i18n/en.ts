@@ -282,6 +282,8 @@ export const en = {
   docs: {
     /* 文档区字标：Charter——理想之城的立城宪章，与主字标同字体同字号 */
     brand: "Utopia Charter",
+    ingestTopic: "Ingest interfaces",
+    mcpTopic: "Agents over MCP",
     backTitle: "Back to Utopia",
     searchPlaceholder: "Search the docs…",
     noResults: "No matches.",
