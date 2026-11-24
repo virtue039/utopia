@@ -786,14 +786,17 @@ impl LlmClient {
             buf.push(&part);
             // SSE 帧以空行分隔；最后一个不完整的帧留在 buf 里等下一片
             while let Some(frame) = buf.next_frame() {
-                self.take_frame(
+                if self.take_frame(
                     &frame,
                     &mut answer,
                     &mut saw_frame,
                     &mut ended,
                     &mut finish_reason,
                     &mut usage,
-                );
+                ) {
+                    buf.bytes.clear();
+                    break 'read;
+                }
                 // 复读了就不再读，回复记成 `repeating`：抽取当它是半截的，前面完整的陈述照收，
                 // 不再等它写到 65,536 个 token。丢掉响应流，连接一关，端点那边也就停了。按帧看
                 // 而不是按网络片段看：一个片段可能装着整段复读。每多 256 字节看一次
@@ -853,7 +856,7 @@ impl LlmClient {
         })
     }
 
-    /// 一个 SSE 帧：取内容增量、认终止信号、顺手记用量。推理的增量读都不读。
+    /// finish_reason 后还可能有用量帧，只有 [DONE] 才立即停读。
     fn take_frame(
         &self,
         frame: &str,
@@ -862,14 +865,14 @@ impl LlmClient {
         ended: &mut bool,
         finish_reason: &mut Option<String>,
         usage: &mut Option<Usage>,
-    ) {
+    ) -> bool {
         for line in frame.lines() {
             let Some(data) = line.strip_prefix("data:").map(str::trim) else {
                 continue;
             };
             if data == "[DONE]" {
                 *ended = true;
-                continue;
+                return true;
             }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
@@ -898,6 +901,7 @@ impl LlmClient {
                 });
             }
         }
+        false
     }
 
     /// 工具对话（非流式）：messages 为 OpenAI 协议原始 JSON
@@ -2262,6 +2266,46 @@ mod tests {
                 server.await.unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn collected_reply_returns_at_done_before_the_http_body_ends() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = wait.await;
+        });
+
+        let client = client_at(addr);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.chat_at_streaming(&[], None)).await;
+        let _ = release.send(());
+        server.await.unwrap();
+        let reply = result
+            .expect("DONE must end the reply before HTTP EOF")
+            .unwrap();
+        assert_eq!(reply.text, "hello");
+        assert_eq!(reply.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                prompt_tokens: 11,
+                completion_tokens: 5
+            })
+        );
     }
 
     async fn an_http_error(body: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
