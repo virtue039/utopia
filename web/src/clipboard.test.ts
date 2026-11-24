@@ -23,8 +23,16 @@ interface FakeArea {
 
 /** node 里没有 DOM：一个只够 copyText 用的 document。`execCommand` 记下它被调的那一刻
  *  页面上选中的是哪段字——那正是浏览器会放进剪贴板的东西 */
-function page(result: boolean | "throw") {
-  const before = { focus: vi.fn() };
+function page(result: boolean | "throw", inDialog = false) {
+  let focusedArea: FakeArea | undefined;
+  let dialogArea: FakeArea | undefined;
+  const dialog = {
+    appendChild: (area: FakeArea) => {
+      dialogArea = area;
+      area.attached = true;
+    },
+  };
+  const before = { focus: vi.fn(), closest: () => inDialog ? dialog : null };
   const areas: FakeArea[] = [];
   const copied: (string | undefined)[] = [];
   vi.stubGlobal("document", {
@@ -44,9 +52,11 @@ function page(result: boolean | "throw") {
         setAttribute: (name) => {
           if (name === "readonly") area.readOnly = true;
         },
-        focus: () => {},
+        focus: () => {
+          if (!inDialog || area === dialogArea) focusedArea = area;
+        },
         select: () => {
-          area.selected = true;
+          area.selected = focusedArea === area;
         },
         remove: () => {
           area.attached = false;
@@ -56,9 +66,10 @@ function page(result: boolean | "throw") {
       return area;
     },
     execCommand: (command: string) => {
-      if (command === "copy") copied.push(areas.find((a) => a.attached && a.selected)?.value);
+      const selected = areas.find((area) => area.attached && area.selected);
+      if (command === "copy") copied.push(selected?.value);
       if (result === "throw") throw new Error("not allowed here");
-      return result;
+      return result && selected !== undefined;
     },
   });
   return { before, areas, copied };
@@ -84,6 +95,15 @@ describe("copyText", () => {
     expect(areas[0].readOnly).toBe(true);
     expect(areas[0].attached).toBe(false);
     expect(before.focus).toHaveBeenCalled();
+  });
+
+  it("copies and restores focus when a modal traps focus", async () => {
+    vi.stubGlobal("navigator", {});
+    const { before, areas, copied } = page(true, true);
+    expect(await copyText("token")).toBe(true);
+    expect(copied).toEqual(["token"]);
+    expect(areas[0].attached).toBe(false);
+    expect(before.focus).toHaveBeenCalledOnce();
   });
 
   it("falls back the same way when the API refuses", async () => {

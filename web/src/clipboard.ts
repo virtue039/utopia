@@ -18,6 +18,8 @@ export async function copyText(text: string): Promise<boolean> {
     // 权限被拒、页面没有焦点：走下面的老办法
   }
   const focused = document.activeElement as HTMLElement | null;
+  // 挂到 body 会让模态框的焦点陷阱把焦点从临时输入框拉走。
+  const host = focused?.closest('dialog, [role="dialog"], [role="alertdialog"]') ?? document.body;
   const area = document.createElement("textarea");
   area.value = text;
   // 只读：手机上不弹键盘；固定在视口里、透明：不把页面滚走，也看不见
@@ -26,7 +28,7 @@ export async function copyText(text: string): Promise<boolean> {
   area.style.top = "0";
   area.style.left = "0";
   area.style.opacity = "0";
-  document.body.appendChild(area);
+  host.appendChild(area);
   try {
     area.focus();
     area.select();
