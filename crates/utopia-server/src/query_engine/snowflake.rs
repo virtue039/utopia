@@ -85,8 +85,8 @@ fn cell(ty: &str, raw: &serde_json::Value) -> serde_json::Value {
             .and_then(|(secs, nanos)| chrono::DateTime::from_timestamp(secs, nanos))
             .map(|t| t.to_rfc3339_opts(AutoSi, true)),
         "timestamp_tz" => s.split_once(' ').and_then(|(at, offset)| {
-            let minutes = offset.trim().parse::<i32>().ok()? - 1440;
-            let zone = chrono::FixedOffset::east_opt(minutes * 60)?;
+            let minutes = offset.trim().parse::<i32>().ok()?.checked_sub(1440)?;
+            let zone = chrono::FixedOffset::east_opt(minutes.checked_mul(60)?)?;
             let (secs, nanos) = epoch(at)?;
             let t = chrono::DateTime::from_timestamp(secs, nanos)?;
             Some(t.with_timezone(&zone).to_rfc3339_opts(AutoSi, false))
@@ -109,7 +109,7 @@ fn epoch(s: &str) -> Option<(i64, u32)> {
         format!("{frac:0<9}").parse::<u32>().ok()?
     };
     if nanos > 0 && whole.starts_with('-') {
-        Some((secs - 1, 1_000_000_000 - nanos))
+        Some((secs.checked_sub(1)?, 1_000_000_000 - nanos))
     } else {
         Some((secs, nanos))
     }
@@ -360,7 +360,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v2/statements"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "resultSetMetaData": { "numRows": 2, "rowType": [
+                "resultSetMetaData": { "numRows": 4, "rowType": [
                     { "name": "D", "type": "date" },
                     { "name": "T", "type": "time" },
                     { "name": "NTZ", "type": "timestamp_ntz" },
@@ -369,7 +369,9 @@ mod tests {
                 ] },
                 "data": [
                     ["18262", "82919.000000000", "1616173619.000000000", "1616173619.500000000", "1616173619.000000000 1500"],
-                    ["-1", "0.000000000", "-1.500000000", null, "1616173619.000000000 1080"]
+                    ["-1", "0.000000000", "-1.500000000", null, "1616173619.000000000 1080"],
+                    [null, null, "-9223372036854775808.5", null, "0 -2147483648"],
+                    [null, null, null, null, "0 2147483647"]
                 ],
                 "code": "090001",
                 "statementHandle": "h1"
@@ -385,6 +387,8 @@ mod tests {
             vec![
                 r#"{"D":"2020-01-01","T":"23:01:59","NTZ":"2021-03-19 17:06:59","LTZ":"2021-03-19T17:06:59.500Z","TZ":"2021-03-19T18:06:59+01:00"}"#,
                 r#"{"D":"1969-12-31","T":"00:00:00","NTZ":"1969-12-31 23:59:58.500","LTZ":null,"TZ":"2021-03-19T11:06:59-06:00"}"#,
+                r#"{"D":null,"T":null,"NTZ":"-9223372036854775808.5","LTZ":null,"TZ":"0 -2147483648"}"#,
+                r#"{"D":null,"T":null,"NTZ":null,"LTZ":null,"TZ":"0 2147483647"}"#,
             ]
         );
     }
