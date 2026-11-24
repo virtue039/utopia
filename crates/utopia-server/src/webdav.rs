@@ -262,11 +262,22 @@ pub async fn fetch(
                 g = g.basic_auth(u, Some(p));
             }
             let got = async {
-                let r = g.send().await?;
+                let mut r = g.send().await?;
                 if !r.status().is_success() {
                     anyhow::bail!("{}", r.status());
                 }
-                Ok::<_, anyhow::Error>(r.bytes().await?)
+                let too_large = || format!("File exceeds {MAX_FILE_BYTES} bytes");
+                if r.content_length().is_some_and(|len| len > MAX_FILE_BYTES) {
+                    anyhow::bail!("{}", too_large());
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = r.chunk().await? {
+                    if chunk.len() > MAX_FILE_BYTES as usize - bytes.len() {
+                        anyhow::bail!("{}", too_large());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok::<_, anyhow::Error>(bytes)
             }
             .await;
             let bytes = match got {
@@ -281,7 +292,7 @@ pub async fn fetch(
             out.push(RemoteFile {
                 external_key: format!("webdav://{host}{path}"),
                 filename: path.rsplit('/').next().unwrap_or(&path).to_string(),
-                bytes: bytes.to_vec(),
+                bytes,
                 last_modified: e.modified,
             });
         }
@@ -457,6 +468,50 @@ mod tests {
         assert_eq!(files[0].filename, "A&B.txt");
         assert_eq!(files[0].bytes, b"hello");
         assert!(files[0].external_key.ends_with("/docs/A&B.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_chunked_download_cannot_outgrow_the_listing_limit() {
+        use axum::{
+            body::{Body, Bytes},
+            routing::{any, get},
+            Router,
+        };
+        use std::convert::Infallible;
+
+        const XML: &str = r#"<multistatus xmlns="DAV:">
+          <response><href>/docs/grown.txt</href><propstat><prop>
+            <getcontentlength>5</getcontentlength></prop></propstat></response>
+          <response><href>/docs/neighbor.txt</href><propstat><prop>
+            <getcontentlength>5</getcontentlength></prop></propstat></response>
+        </multistatus>"#;
+        let app = Router::new()
+            .route(
+                "/docs",
+                any(|| async { (axum::http::StatusCode::MULTI_STATUS, XML) }),
+            )
+            .route(
+                "/docs/grown.txt",
+                get(|| async {
+                    let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+                    let count = MAX_FILE_BYTES / chunk.len() as u64 + 1;
+                    Body::from_stream(futures_util::stream::iter(
+                        (0..count).map(move |_| Ok::<_, Infallible>(chunk.clone())),
+                    ))
+                }),
+            )
+            .route("/docs/neighbor.txt", get(|| async { "hello" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = fetch(&reqwest::Client::new(), &base, "/docs", None).await;
+        server.abort();
+
+        let (files, truncated) = result.unwrap();
+        assert!(!truncated);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "neighbor.txt");
+        assert_eq!(files[0].bytes, b"hello");
     }
 
     #[tokio::test]
