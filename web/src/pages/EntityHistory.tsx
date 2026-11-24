@@ -10,7 +10,7 @@ import { api, type EntityHistoryEvent } from "../api";
 import { S } from "../i18n";
 import { predicateSentence } from "../predicateText";
 import { useKbId } from "../kb";
-import { Pager } from "../ui";
+import { LinkButton, Pager } from "../ui";
 
 const PER = 20;
 
@@ -175,6 +175,14 @@ export function EntityHistory({ kbId, entityId }: { kbId: string; entityId: stri
 
   const total = q.data?.total ?? 0;
   if (q.isPending) return <p className="p-2 text-body text-ink-2">{S.nav.loading}</p>;
+  if (q.isError && !q.data) {
+    return (
+      <div className="flex items-center gap-2 p-2">
+        <p role="alert" className="text-small text-danger">{q.error.message}</p>
+        <LinkButton onClick={() => void q.refetch()}>{S.ask.retryHistory}</LinkButton>
+      </div>
+    );
+  }
   // 只有"一条都没有"才是空。记录轴上首次断言本身就是一次事件——
   // "我们何时、从哪份文档得知这件事"是这条轴要回答的问题的一半
   if (total === 0) return <p className="p-2 text-small text-ink-2">{S.graph.historyEmpty}</p>;
