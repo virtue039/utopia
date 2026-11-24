@@ -18,10 +18,11 @@ export function fmtTime(
 ): string | null {
   if (!iso) return null;
   const d = new Date(iso);
-  const y = d.getUTCFullYear();
+  const year = d.getUTCFullYear();
+  const y = year >= 0 ? String(year).padStart(4, "0") : String(year);
   const m = String(d.getUTCMonth() + 1).padStart(2, "0");
   const day = String(d.getUTCDate()).padStart(2, "0");
-  if (precision === "year") return `${y}`;
+  if (precision === "year") return y;
   if (precision === "month") return `${y}-${m}`;
   // 小时以下（0024）：ISO 的缩略形式，带 Z——钟点没有时区就不是时刻
   const hh = String(d.getUTCHours()).padStart(2, "0");

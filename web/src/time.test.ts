@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDateInput } from "./time";
+import { fmtTime, parseDateInput } from "./time";
 
 describe("parseDateInput", () => {
   it.each([
@@ -28,4 +28,22 @@ describe("parseDateInput", () => {
       expect(parseDateInput(input)).toBeNull();
     },
   );
+});
+
+describe("fmtTime", () => {
+  it.each([
+    ["year", "01-01T00:00:00.000Z", ""],
+    ["month", "06-01T00:00:00.000Z", "-06"],
+    ["day", "06-15T00:00:00.000Z", "-06-15"],
+    ["hour", "06-15T04:00:00.000Z", "-06-15T04Z"],
+    ["minute", "06-15T04:23:00.000Z", "-06-15T04:23Z"],
+    ["second", "06-15T04:23:42.000Z", "-06-15T04:23:42Z"],
+  ])("round-trips an early year at %s precision", (precision, isoSuffix, formSuffix) => {
+    for (const year of ["0001", "0999"]) {
+      const iso = year + "-" + isoSuffix;
+      const formatted = fmtTime(iso, precision);
+      expect(formatted).toBe(year + formSuffix);
+      expect(parseDateInput(formatted ?? "")).toEqual({ iso, precision });
+    }
+  });
 });
